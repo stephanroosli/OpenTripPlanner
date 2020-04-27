@@ -1,22 +1,6 @@
 version: 2.1
 
-orbs:
-  helm: entur/helm@0.0.1
-  slack: circleci/slack@2.2.0
-  clair: ovotech/clair-scanner@1.4.25
-  docker: circleci/docker@0.5.13
-
 executors:
-  java-11:
-    docker:
-      - image: circleci/openjdk:11-jdk
-        environment:
-          _JAVA_OPTIONS: -Xmx1024m
-          TERM: dumb
-          TZ: "/usr/share/zoneinfo/Europe/Stockholm"
-  entur-cci-toolbox:
-    docker:
-      - image: entur/cci-toolbox:2.0
   cci-toolbox-java11:
     docker:
       - image: eu.gcr.io/entur-system-1287/circleci-toolbox-image-java11
@@ -27,46 +11,7 @@ executors:
       DEBIAN_FRONTEND: "noninteractive"
       MAVEN_OPTS: -Xmx3G
 aliases:
-  ### Application version
-  - &get-version-git-tag
-    name: Getting app version from git-tag
-    command: |
-      currentVersion=$(git describe --tags --abbrev=0 | cut -d'-' -f2)
-      nextVersionPatchNumber=$(($(echo $currentVersion | grep -o '[0-9]*$')+1))
-      staticVersion=$(echo $currentVersion | grep -o '[0-9].[0-9].')
-      echo release-$staticVersion$nextVersionPatchNumber
-      APP_VERSION=release-$staticVersion$nextVersionPatchNumber
-      echo "export APP_VERSION=$APP_VERSION" >> $BASH_ENV
-      echo $APP_VERSION > ./app_version
-  - &get-app-version-from-file
-    name: Getting release version from app_version file
-    command: |
-      echo "export APP_VERSION=$(cat ./app_version)" >> $BASH_ENV
-
-  - &set-versions-to-app-version
-    name: Set version in helm dir to $APP_VERSION
-    command: |
-      echo "Setting helm versions to $APP_VERSION"
-      pushd helm/$CIRCLE_PROJECT_REPONAME
-      sed -i "s/version:.*$/version: '$APP_VERSION'/g"  ./Chart.yaml
-      sed -i "s/appVersion:.*$/appVersion: '$APP_VERSION'/g"  ./Chart.yaml
-      sed -i "s/imageTag:.*$/imageTag: $APP_VERSION/g"  ./values.yaml
-      popd
-  - &GCP-auth-journey-planner
-    name: GCP Authentication for Google Cloud Deploy
-    command: |
-      echo $GCLOUD_SERVICE_KEY > ${HOME}/account-auth.json
-      gcloud auth activate-service-account --key-file ${HOME}/account-auth.json
-      gcloud beta container clusters get-credentials $OTP_CONTAINER_CLUSTER --region $OTP_CLUSTER_REGION --project $CLOUDSDK_CORE_PROJECT
-
-  - &GCP-auth-graph-builder
-    name: GCP Authentication for Google Cloud Deploy
-    command: |
-      echo $GCLOUD_SERVICE_KEY > ${HOME}/account-auth.json
-      gcloud auth activate-service-account --key-file ${HOME}/account-auth.json
-      gcloud beta container clusters get-credentials $CLOUDSDK_CONTAINER_CLUSTER --region $CLOUDSDK_COMPUTE_ZONE --project $CLOUDSDK_CORE_PROJECT
-
-  - &GCP-docker-auth
+  - &GCP-auth
     name: GCP Authenticate
     command: |
       echo 'export GCLOUD_SERVICE_KEY="$GCLOUD_SERVICE_KEY"' >> $BASH_ENV
@@ -75,38 +20,30 @@ aliases:
     name: Docker login
     command: |
       docker login -u "_json_key" -p "${DOCKER_PASSWORD}" eu.gcr.io
+  - &tag-git-version
+    name: Tag git commit with build version and push to github
+    command: |
+      git config --global user.email "circleci@entur.no"
+      git config --global user.name "circleci"
+      git tag $VERSION
+      git push origin $VERSION
+  - &create-image-version
+    name: Create new image version and store to env var and as file in workspace
+    command: |
+      echo "export VERSION=$CIRCLE_BRANCH-v$CIRCLE_BUILD_NUM-$(echo -n $CIRCLE_SHA1 | tail -c 8)"  >> $BASH_ENV
+      echo "$CIRCLE_BRANCH-v$CIRCLE_BUILD_NUM-$(echo -n $CIRCLE_SHA1 | tail -c 8)" > version
+  - &read-image-version
+    name: Read new image version from workspace
+    command: |
+      echo "export VERSION=$(cat ./version)" >> $BASH_ENV
   - &docker-build-and-push
     name: Docker build and push
     command: |
       IMAGE="eu.gcr.io/entur-system-1287/otp"
       echo "Image: ${IMAGE}"
       docker build -t $IMAGE .
-      docker tag $IMAGE "${IMAGE}":"${APP_VERSION}"
+      docker tag $IMAGE "${IMAGE}":"${VERSION}"
       docker push $IMAGE
-  - &git-push-next-version-release
-    name: Push to repository
-    command: |
-      echo "Trying to tag $APP_VERSION"
-      git config --global user.email "circleci@entur.org"
-      git config --global user.name "EnturCircleCi"
-      git pull
-      currentVersion=$(git describe --tags --abbrev=0 | cut -d'-' -f2)
-      nextVersionPatchNumber=$(($(echo $currentVersion | grep -o '[0-9]*$')+1))
-      staticVersion=$(echo $currentVersion | grep -o '[0-9].[0-9].')
-      echo release-$staticVersion$nextVersionPatchNumber
-      APP_VERSION=release-$staticVersion$nextVersionPatchNumber
-      git tag -a $APP_VERSION -m "Tagging current version"
-      git add helm/$CIRCLE_PROJECT_REPONAME/Chart.yaml
-      git add helm/$CIRCLE_PROJECT_REPONAME/values.yaml
-      git add pom.xml
-      git commit -m "Helm Update App Version $APP_VERSION [ci skip]"
-      git push --tags --set-upstream origin $CIRCLE_BRANCH
-
-  - &team-ror-circleci-slackhook
-      https://hooks.slack.com/services/${SLACK_API_KEY_CIRCLE_CI}
-
-  - &team-ror-releases-slackhook
-      https://hooks.slack.com/services/${SLACK_API_KEY_RELEASES}
 
   - &save-test-results
     name: Save test results
@@ -117,37 +54,6 @@ aliases:
 
     when: always
 
-  - &deploy-payload
-      "*Ready to Deploy*: <$CIRCLE_BUILD_URL|$CIRCLE_PROJECT_REPONAME #$CIRCLE_PREVIOUS_BUILD_NUM> to *$NAMESPACE*\n
-        Repository: <https://circleci.com/bb/enturas/workflows/$CIRCLE_PROJECT_REPONAME|$CIRCLE_PROJECT_USERNAME/$CIRCLE_PROJECT_REPONAME>\n
-        Branch: <https://circleci.com/bb/enturas/$CIRCLE_PROJECT_REPONAME/tree/$CIRCLE_BRANCH|$CIRCLE_BRANCH>\n
-        Version: $APP_VERSION \n
-        User: $CIRCLE_USERNAME"
-
-  - &success-payload
-      ":tada: Job $CIRCLE_STAGE has succeeded!\n
-         Version: $APP_VERSION \n
-         User: $CIRCLE_USERNAME"
-
-  - &failure-payload
-      ":red_circle: Job $CIRCLE_STAGE has failed!\n
-         Version: $APP_VERSION \n
-         User: $CIRCLE_USERNAME"
-
-commands:
-  slack-status:
-    parameters:
-      success_payload:
-        type: string
-        default: *success-payload
-    steps:
-      - attach_workspace:
-          at: .
-      - run: *get-app-version-from-file
-      - slack/status:
-          webhook: *team-ror-circleci-slackhook
-          success_message: << parameters.success_payload >>
-          failure_message: *failure-payload
 jobs:
   test:
     executor: cci-toolbox-java11
@@ -177,8 +83,9 @@ jobs:
           paths:
             - ~/.m2
           key: dep-cache-{{ checksum "pom.xml" }}
+      - run: *create-image-version
+      - run: *tag-git-version
       # Cannot use -o because of snapshot dependencies.
-      - run: *get-version-git-tag
       - run: mvn deploy -s /tools/m2/settings.xml -DskipTests
       - persist_to_workspace:
           root: ~/project
@@ -187,10 +94,9 @@ jobs:
             - pom.xml
             - .circleci
             - helm/*/
-            - ./app_version
+            - ./version
             - Dockerfile
             - docker
-      - slack-status
   publish-docker:
     docker:
       - image: eu.gcr.io/entur-system-1287/circleci-toolbox-image-java11
@@ -204,69 +110,10 @@ jobs:
           at: ~/project
       - setup_remote_docker:
           docker_layer_caching: true
-      - run: *get-app-version-from-file
-      - run: *GCP-docker-auth
+      - run: *GCP-auth
       - run: *docker-login
+      - run: *read-image-version
       - run: *docker-build-and-push
-  prepare-next-release:
-    executor: cci-toolbox-java11
-    steps:
-      - checkout
-      - restore_cache:
-          key: dep-cache-{{ checksum "pom.xml" }}
-      - attach_workspace:
-          at: ~/project
-      - add_ssh_keys:
-          fingerprints:
-            - $SSH_FINGERPRINT
-      - run: *get-app-version-from-file
-      - run: *set-versions-to-app-version
-      - run: *git-push-next-version-release
-      - slack-status
-
-  deploy-journey-planner:
-    executor: entur-cci-toolbox
-    steps:
-      - checkout
-      - attach_workspace:
-          at: .
-      - run: *get-app-version-from-file
-      - run: *set-versions-to-app-version
-      - run: *GCP-auth-journey-planner
-      - run:
-          name: Deploy Helm chart to Kubernetes
-          command: helm upgrade --install otp ./helm/$CIRCLE_PROJECT_REPONAME --values=./helm/$CIRCLE_PROJECT_REPONAME/$NAMESPACE-c2-values.yaml --namespace=$NAMESPACE
-      - run:
-          name: Deployed helm chart
-          command: cat ./helm/$CIRCLE_PROJECT_REPONAME/Chart.yaml
-      - slack-status
-
-  deploy-graph-builder:
-    executor: entur-cci-toolbox
-    steps:
-      - checkout
-      - attach_workspace:
-          at: .
-      - run: *get-app-version-from-file
-      - run: *set-versions-to-app-version
-      - run: *GCP-auth-graph-builder
-      - run:
-          name: Deploy Helm chart to Kubernetes
-          command: helm upgrade --install graph-builder ./helm/$CIRCLE_PROJECT_REPONAME --values=./helm/$CIRCLE_PROJECT_REPONAME/$NAMESPACE-c2-values.yaml --set cronjobRedeployGraphBuilder.enabled=true --set journeyPlanner.enabled=false --set service.enabled=false --set horizontalPodAutoscaler.enabled=false --set ingress.c2.enabled=false --set cronjobRedeployOtp.enabled=false --namespace=$NAMESPACE
-      - run:
-          name: Deployed helm chart
-          command: cat ./helm/$CIRCLE_PROJECT_REPONAME/Chart.yaml
-      - slack-status
-
-  slack-approval:
-    executor: slack/alpine
-    steps:
-      - attach_workspace:
-          at: .
-      - run: *get-app-version-from-file
-      - slack/approval:
-          webhook: *team-ror-releases-slackhook
-          message: *deploy-payload
 
 workflows:
   version: 2.1
@@ -293,80 +140,3 @@ workflows:
                 - rutebanken_develop
           requires:
             - build-release
-          post-steps:
-            - slack-status
-      - deploy-journey-planner:
-          name: deploy-journey-planner-dev-release
-          context: dev
-          requires:
-            - publish-docker
-      - deploy-graph-builder:
-          name: deploy-graph-builder-dev-release
-          context: dev
-          requires:
-            - publish-docker
-      - prepare-next-release:
-          context: dev
-          filters:
-            branches:
-              only:
-                - rutebanken_develop
-          requires:
-            - deploy-journey-planner-dev-release
-            - deploy-graph-builder-dev-release
-      - slack-approval:
-          name: staging-deploy-journey-planner-message-release
-          context: stage
-          requires:
-            - deploy-journey-planner-dev-release
-      - slack-approval:
-          name: staging-deploy-graph-builder-message-release
-          context: stage
-          requires:
-            - deploy-graph-builder-dev-release
-      - approve-staging-jp-release:
-          type: approval
-          requires:
-            - staging-deploy-journey-planner-message-release
-      - approve-staging-gb-release:
-          type: approval
-          requires:
-            - staging-deploy-graph-builder-message-release
-      - deploy-journey-planner:
-          name: deploy-journey-planner-staging-release
-          context: stage
-          requires:
-            - approve-staging-jp-release
-      - deploy-graph-builder:
-          name: deploy-graph-builder-staging-release
-          context: stage
-          requires:
-            - approve-staging-gb-release
-      - slack-approval:
-          name: production-deploy-journey-planner-message-release
-          context: production
-          requires:
-            - deploy-journey-planner-staging-release
-      - slack-approval:
-          name: production-deploy-graph-builder-message-release
-          context: production
-          requires:
-            - deploy-graph-builder-staging-release
-      - approve-production-jp-release:
-          type: approval
-          requires:
-            - production-deploy-journey-planner-message-release
-      - approve-production-gb-release:
-          type: approval
-          requires:
-            - production-deploy-graph-builder-message-release
-      - deploy-journey-planner:
-          name: deploy-journey-planner-production-release
-          context: production
-          requires:
-            - approve-production-jp-release
-      - deploy-graph-builder:
-          name: deploy-graph-builder-production-release
-          context: production
-          requires:
-            - approve-production-gb-release
